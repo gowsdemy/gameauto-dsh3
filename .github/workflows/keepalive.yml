@@ -3,7 +3,7 @@ name: Keep Alive
 on:
   schedule:
     - cron: '0 17 * * *' # 北京时间每天凌晨 1:00 执行 (UTC 17:00)
-workflow_dispatch:    # 允许手动触发
+    workflow_dispatch:    # 允许手动触发
 jobs:
   keepalive:
     runs-on: ubuntu-latest
