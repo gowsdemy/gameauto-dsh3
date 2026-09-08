@@ -161,6 +161,7 @@ class Gamemale:
                 "browser": {"has_seen_welcome_to_edge": True,
                             "path_with_browser_history": False,
                             "show_home_button": False},
+                "sync_disabled": True,
                 "extensions": {"install_success_notification_enabled": False},
                 "shopping": {"enabled": False},
             }
@@ -171,8 +172,10 @@ class Gamemale:
         port = 9335
         argv = [EDGE_EXE, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
                 "--no-first-run", "--no-default-browser-check",
-                "--disable-features=msEdgeFirstRunExperience,msEdgeShoppingAssistantEnabled,"
+                "--disable-features=msEdgeFirstRunExperience,msEdgeAutomaticSignin,"
+                "msEdgeSyncConfirmationDialog,msEdgeShoppingAssistantEnabled,"
                 "msEdgeEdgeShoppingAssistantEnabled,msEdgeDefaultBrowserPrompt,msEdgeSidebarV2",
+                "--disable-extensions", "--disable-component-extensions-with-background-pages",
                 "--disable-component-update",
                 "--window-size=1366,900", "about:blank"]
         subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
