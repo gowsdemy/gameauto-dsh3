@@ -45,7 +45,7 @@ def load_env_file(path="config.env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            k = k.strip()
+            k = k.strip().lstrip("\ufeff")   # 去掉 Windows 记事本可能写入的 UTF-8 BOM
             v = v.strip().strip('"').strip("'")
             if k:
                 # 本地运行时，配置文件应覆盖系统已存在的同名变量（如 Windows 自带 USERNAME）
