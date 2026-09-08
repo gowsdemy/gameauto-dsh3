@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import base64
+import shutil
 import subprocess
 import urllib.request
 import smtplib
@@ -127,13 +128,53 @@ class Gamemale:
                 time.sleep(1)
         return None
 
+    def _kill_my_edge(self, profile):
+        """结束本脚本上一次启动、占用该 profile 的 Edge 进程，避免 profile 锁定导致启动失败。"""
+        try:
+            out = subprocess.run(
+                "wmic process where \"name='msedge.exe'\" get ProcessId,CommandLine /format:csv",
+                capture_output=True, text=True, timeout=20).stdout or ""
+        except Exception:
+            return
+        for line in out.splitlines():
+            if "_edge_profile" not in line:
+                continue
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            pid = parts[-1]              # ProcessId 在 CSV 最后一列
+            if pid.isdigit() and pid != "ProcessId":
+                subprocess.run(f"taskkill /f /pid {pid}", shell=True, capture_output=True)
+
     def _launch_real_edge(self):
         profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_edge_profile")
+        self._kill_my_edge(profile)
+        # 每次全新 profile，避免上次登录会话残留导致“已登录”而看不到登录表单
+        shutil.rmtree(profile, ignore_errors=True)
         os.makedirs(profile, exist_ok=True)
+        # 预置 Preferences，关闭 Edge 首次运行/引导/购物助手，避免弹出“插件安装成功”等标签页
+        try:
+            prefs_path = os.path.join(profile, "Default", "Preferences")
+            os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+            prefs = {
+                "first_run_ui": {"skip": True, "bypass_tos": True},
+                "browser": {"has_seen_welcome_to_edge": True,
+                            "path_with_browser_history": False,
+                            "show_home_button": False},
+                "extensions": {"install_success_notification_enabled": False},
+                "shopping": {"enabled": False},
+            }
+            with open(prefs_path, "w", encoding="utf-8") as f:
+                json.dump(prefs, f)
+        except Exception as e:
+            self.main_logger.debug(f"写 Preferences 失败: {e}")
         port = 9335
         argv = [EDGE_EXE, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
                 "--no-first-run", "--no-default-browser-check",
-                "--disable-features=msEdgeFirstRunExperience", "--window-size=1366,900", "about:blank"]
+                "--disable-features=msEdgeFirstRunExperience,msEdgeShoppingAssistantEnabled,"
+                "msEdgeEdgeShoppingAssistantEnabled,msEdgeDefaultBrowserPrompt,msEdgeSidebarV2",
+                "--disable-component-update",
+                "--window-size=1366,900", "about:blank"]
         subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return self._wait_debug_port(port), port
 
@@ -461,14 +502,25 @@ class Gamemale:
         message['From'] = formataddr((Header("GM-Bot", 'utf-8').encode(), mail_user))
         message['To'] = formataddr((Header("Master", 'utf-8').encode(), mail_to))
         message['Subject'] = Header(f"GameMale 任务运行报告 - {self.sign_result}", 'utf-8')
-        try:
-            server = smtplib.SMTP_SSL(smtp_host, 465)
-            server.login(mail_user, mail_pass)
-            server.sendmail(mail_user, [mail_to], message.as_string())
-            server.quit()
-            self.notice_logger.info("推送邮件发送成功！")
-        except Exception as e:
-            self.notice_logger.error(f"推送邮件发送失败: {e}")
+        # 依次尝试不同端口/加密方式，哪个能通用哪个（163 常用 25+STARTTLS；也兼容 465/587）
+        attempts = [(25, 'starttls'), (465, 'ssl'), (587, 'starttls')]
+        last_err = None
+        for port, mode in attempts:
+            try:
+                if mode == 'ssl':
+                    server = smtplib.SMTP_SSL(smtp_host, port, timeout=15)
+                else:
+                    server = smtplib.SMTP(smtp_host, port, timeout=15)
+                    server.starttls()
+                server.login(mail_user, mail_pass)
+                server.sendmail(mail_user, [mail_to], message.as_string())
+                server.quit()
+                self.notice_logger.info(f"推送邮件发送成功！(port={port} {mode})")
+                return
+            except Exception as e:
+                last_err = e
+                self.notice_logger.warning(f"SMTP {port}/{mode} 失败: {e}")
+        self.notice_logger.error(f"推送邮件发送失败（所有端口均失败）: {last_err}")
 
     def run(self):
         self.main_logger.info("=== GM-All-In-One v2 任务引擎启动（真实 Edge 方案）===")
