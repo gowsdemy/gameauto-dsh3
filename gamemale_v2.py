@@ -48,7 +48,8 @@ def load_env_file(path="config.env"):
             k = k.strip()
             v = v.strip().strip('"').strip("'")
             if k:
-                os.environ.setdefault(k, v)
+                # 本地运行时，配置文件应覆盖系统已存在的同名变量（如 Windows 自带 USERNAME）
+                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------
