@@ -149,12 +149,15 @@ class Gamemale:
     #  Cloudflare Turnstile 解门
     # ------------------------------------------------------------------ #
     def _is_gated(self, html):
-        """判断响应是否为 Turnstile '请稍候' 拦截页。"""
+        """判断响应是否为 Turnstile '请稍候' 拦截页（用页面特征识别，避免误判真实论坛页）。"""
         if not html:
             return False
         low = html.lower()
-        return ("请稍候" in html) or ("dev8133_cloudflare" in low) or \
-               ("challenges.cloudflare.com/turnstile" in low)
+        gate_title = "请稍候" in html
+        turnstile_widget = ("challenges.cloudflare.com/turnstile" in low) or \
+                           ('id="turnstile"' in low) or ("turnstile.render" in low)
+        challenge_box = "检查站点连接是否安全" in html
+        return gate_title or (turnstile_widget and challenge_box)
 
     def _sync_browser_cookies_to_session(self, cookies):
         """把浏览器里的会话 Cookie 拷进 requests 会话，从而让后续请求携带已验证标识。"""
@@ -186,8 +189,10 @@ class Gamemale:
             "Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>8});"
         )
         with sync_playwright() as p:
+            # 默认无头运行；若在本地家庭 IP 下 Turnstile 仍不过，可设 HEADLESS=0 用真实窗口（更像真人）
+            headless = (os.getenv("HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
             launch_kwargs = dict(
-                headless=True,
+                headless=headless,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox", "--disable-dev-shm-usage",
