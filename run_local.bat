@@ -21,7 +21,7 @@ if not exist .venv (
 call .venv\Scripts\activate.bat
 echo [步骤] 正在安装/更新依赖...
 pip install --upgrade pip
-pip install curl_cffi ddddocr playwright
+pip install ddddocr playwright
 python -m playwright install chromium
 
 REM ---- 3) 运行 -------------

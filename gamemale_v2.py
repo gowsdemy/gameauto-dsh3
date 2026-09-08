@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GM-All-In-One v2 —— 适配 Cloudflare Turnstile 人机验证门（真实 Edge + curl_cffi 方案）
+GM-All-In-One v2 —— 适配 Cloudflare Turnstile 人机验证门（真实 Edge 方案）
 ============================================================
 论坛 www.gamemale.com 的 Discuz 插件 dev8133_cloudflare 加了 Cloudflare Turnstile
-"请进行人机验证"门。两处关键点（均已在真实环境验证）：
-  1. Turnstile 会拦"自动化内核"浏览器（Playwright 自带的 Chromium 会报 600010），
-     但【真实的 Edge】能通过。本脚本用"子进程启动真实 msedge + CDP 连接"的方式
-     打开真实 Edge 加载论坛，让验证通过。
-  2. Python 的 requests 走 Cloudflare 会被立刻重置连接（TLS 指纹不认），
-     但 curl_cffi 伪装成 Chrome 的 TLS 就能正常访问。因此脚本改用 curl_cffi 会话。
+"请进行人机验证"门。实测（真实环境）：
+  - Playwright 自带的 Chromium 会被识别为自动化，验证报 600010；
+  - 【真实 Edge】能通过验证；
+  - 外部库(requests / curl_cffi) 连 Cloudflare 会被重置连接（TLS 指纹不认）。
 
-流程：
-  1) ensure_access(): 用真实 Edge 过 Turnstile，拿到 16 个会话 Cookie（含 cloudflare_check）。
-  2) 把这些 Cookie 喂给 curl_cffi(impersonate="chrome") 会话。
-  3) 用 curl_cffi 完成 formhash / 验证码 OCR / 登录 / 签到 / 抽奖 / 互动 / 抓资产 / 邮件。
+因此本脚本采用：【真实 Edge】加载论坛通过 Turnstile，然后【所有请求都通过
+Edge 页面内的 fetch() 发出】——即用 Edge 的真内核 + Cookie + TLS，既能免验证，
+又不会被重置。登录/签到/抽奖/互动/抓资产/邮件全部保留。
 """
 import re
 import os
 import sys
 import json
 import time
+import base64
 import subprocess
 import urllib.request
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
+from urllib.parse import urlencode
 
-from curl_cffi import requests as cffi_requests
 import ddddocr
 
 EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-CDP_PORT = 9333
 
 
 def load_env_file(path="config.env"):
-    """按 KEY=VALUE 读取配置文件（# 为注释），覆盖已有同名环境变量。"""
+    """按 KEY=VALUE 读取配置文件（# 为注释），覆盖同名环境变量。"""
     if not os.path.exists(path):
         return
     with open(path, encoding="utf-8") as f:
@@ -52,10 +49,11 @@ def load_env_file(path="config.env"):
 
 
 def setup_logger(name, verbose=False):
-    logger = logging = __import__("logging").getLogger(name)
-    logging.setLevel(logging.DEBUG if verbose else logging.INFO)
-    if logging.handlers:
-        logging.handlers.clear()
+    import logging
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    if logger.handlers:
+        logger.handlers.clear()
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
     formatter = logging.Formatter(
@@ -63,8 +61,32 @@ def setup_logger(name, verbose=False):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     console_handler.setFormatter(formatter)
-    logging.addHandler(console_handler)
+    logger.addHandler(console_handler)
     return logger
+
+
+# 在 Edge 页面里执行的 fetch 辅助脚本
+_JS_TEXT = """async (opts) => {
+  const init = {method: (opts.method||'GET'), credentials:'include'};
+  init.headers = Object.assign({}, opts.headers||{});
+  if (opts.body) {
+    init.body = opts.body;
+    init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+  }
+  const r = await fetch(opts.url, init);
+  return await r.text();
+}
+"""
+
+_JS_B64 = """async (url) => {
+  const r = await fetch(url, {credentials:'include'});
+  const b = await r.arrayBuffer();
+  const bytes = new Uint8Array(b);
+  let bin='';
+  for (let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+"""
 
 
 class Gamemale:
@@ -90,33 +112,31 @@ class Gamemale:
         self.answer = str(answer) if answer else ""
         self.hostname = "www.gamemale.com"
         self.base_url = f"https://{self.hostname}"
-        self.ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                   '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
-
-        # 用 curl_cffi 伪装 Chrome TLS，避免被 Cloudflare 重置连接
-        self.session = cffi_requests.Session(impersonate="chrome")
-        self.session.headers.update({'User-Agent': self.ua,
-                                     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
-        self.proxy_http = self._build_proxy()
-        if self.proxy_http:
-            self.session.proxies.update({"http": self.proxy_http, "https": self.proxy_http})
-
-    def _build_proxy(self):
-        url = (os.getenv("PROXY_URL") or "").strip()
-        if url:
-            return url
-        host = (os.getenv("PROXY_HOST") or "").strip()
-        port = (os.getenv("PROXY_PORT") or "").strip()
-        if not (host and port):
-            return None
-        user = os.getenv("PROXY_USER") or ""
-        pwd = os.getenv("PROXY_PASS") or ""
-        cred = f"{user}:{pwd}@" if user else ""
-        return f"http://{cred}{host}:{port}"
+        self.page = None   # 真实 Edge 页面，用于全部请求
 
     # ------------------------------------------------------------------ #
-    #  真实 Edge 过 Turnstile
+    #  真实 Edge 启动 + Turnstile 通过
     # ------------------------------------------------------------------ #
+    def _wait_debug_port(self, port, timeout=40):
+        url = f"http://127.0.0.1:{port}/json/version"
+        for _ in range(int(timeout)):
+            try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                    return json.loads(r.read().decode())
+            except Exception:
+                time.sleep(1)
+        return None
+
+    def _launch_real_edge(self):
+        profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_edge_profile")
+        os.makedirs(profile, exist_ok=True)
+        port = 9335
+        argv = [EDGE_EXE, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+                "--no-first-run", "--no-default-browser-check",
+                "--disable-features=msEdgeFirstRunExperience", "--window-size=1366,900", "about:blank"]
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return self._wait_debug_port(port), port
+
     def _is_gated(self, html, title=""):
         if not html:
             return False
@@ -130,113 +150,80 @@ class Gamemale:
         low = (content or "").lower()
         return ("discuz" in low) or ("member.php" in low) or ("gamemale" in low and "登录" in content)
 
-    def _wait_debug_port(self, port, timeout=40):
-        url = f"http://127.0.0.1:{port}/json/version"
-        for _ in range(int(timeout / 1)):
-            try:
-                with urllib.request.urlopen(url, timeout=2) as r:
-                    return json.loads(r.read().decode())
-            except Exception:
-                time.sleep(1)
-        return None
-
-    def _launch_real_edge(self):
-        profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_edge_profile")
-        os.makedirs(profile, exist_ok=True)
-        argv = [EDGE_EXE, f"--remote-debugging-port={CDP_PORT}",
-                f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
-                "--disable-features=msEdgeFirstRunExperience", "--window-size=1366,900", "about:blank"]
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return self._wait_debug_port(CDP_PORT)
-
     def solve_turnstile(self):
-        """用【真实 Edge】加载论坛，让 Turnstile 通过（自动或用户手动点），拿回 Cookie。"""
+        """用真实 Edge 打开论坛，让 Turnstile 通过，并保留页面对象供后续 fetch。"""
         self.login_logger.info("正在用真实 Edge 打开论坛以通过 Cloudflare 验证 ...")
-        v = self._launch_real_edge()
+        v, port = self._launch_real_edge()
         if not v:
-            self.login_logger.error("无法启动/连接真实 Edge（远程调试端口）。")
+            self.login_logger.error("无法启动/连接真实 Edge。")
             return False
         self.login_logger.info(f"真实 Edge 已就绪: {v.get('Browser', '?')}")
 
         from playwright.sync_api import sync_playwright
-        cleared = False
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-            except Exception as e:
-                self.login_logger.error(f"CDP 连接失败: {e}")
-                return False
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = ctx.new_page()
-            page.set_default_timeout(60000)
-            try:
-                page.goto(self.base_url + "/", wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                self.login_logger.warning(f"加载论坛异常: {e}")
-            self.login_logger.info("真实 Edge 窗口已打开。若验证未自动通过，请手动点击验证框（最多等 180 秒）")
-            for i in range(36):
-                time.sleep(5)
-                try:
-                    title = page.title()
-                    content = page.content()
-                    gated = self._is_gated(content, title)
-                    real = self._is_real_forum(content)
-                    self.login_logger.info(f"  t={i*5}s gated={gated} real={real} len={len(content)}")
-                    if real and not gated:
-                        cleared = True
-                        break
-                except Exception as e:
-                    self.login_logger.warning(f"  检测异常: {e}")
-
-            if cleared:
-                cookies = ctx.cookies()
-                self._sync_cookies_to_session(cookies)
-                self.login_logger.info(f"Cloudflare 验证通过，已导入 {len(cookies)} 个会话 Cookie")
-                try:
-                    text = page.content()
-                    fm = re.search(r'<input type="hidden" name="formhash" value="([0-9a-f]+)" />', text)
-                    if fm:
-                        self.post_formhash = fm.group(1)
-                        self.login_logger.info(f"已捕获全局 formhash: {self.post_formhash[:8]}...")
-                except Exception:
-                    pass
-            else:
-                self.login_logger.error("验证未通过（可能未点击，或该网络仍被拦）。")
-
-            try:
-                browser.close()
-            except Exception:
-                pass
-        return cleared
-
-    def _sync_cookies_to_session(self, cookies):
-        for c in cookies:
-            try:
-                self.session.cookies.set(c["name"], c["value"],
-                                         domain=c.get("domain"), path=c.get("path") or "/")
-            except Exception as e:
-                self.main_logger.debug(f"cookie {c.get('name')} 导入失败: {e}")
-
-    def ensure_access(self):
-        """先访问首页，若被拦截则用真实 Edge 解门。返回是否可用。"""
+        self._pw = sync_playwright().start()
         try:
-            r = self.session.get(self.base_url + "/", timeout=25)
-            if not self._is_gated(r.text):
-                self.login_logger.info("论坛未被 Turnstile 拦截，直接访问。")
-                fm = re.search(r'<input type="hidden" name="formhash" value="([0-9a-f]+)"', r.text or "")
+            browser = self._pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        except Exception as e:
+            self.login_logger.error(f"CDP 连接失败: {e}")
+            return False
+        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = ctx.new_page()
+        page.set_default_timeout(60000)
+        try:
+            page.goto(self.base_url + "/", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            self.login_logger.warning(f"加载论坛异常: {e}")
+        self.login_logger.info("真实 Edge 窗口已打开。若验证未自动通过，请手动点击验证框（最多等 180 秒）")
+        cleared = False
+        for i in range(36):
+            time.sleep(5)
+            try:
+                title = page.title()
+                content = page.content()
+                gated = self._is_gated(content, title)
+                real = self._is_real_forum(content)
+                self.login_logger.info(f"  t={i*5}s gated={gated} real={real} len={len(content)}")
+                if real and not gated:
+                    cleared = True
+                    break
+            except Exception as e:
+                self.login_logger.warning(f"  检测异常: {e}")
+        if cleared:
+            self.page = page
+            self.login_logger.info("Cloudflare 验证通过。")
+            try:
+                text = page.content()
+                fm = re.search(r'<input type="hidden" name="formhash" value="([0-9a-f]+)"', text)
                 if fm:
                     self.post_formhash = fm.group(1)
-                return True
-        except Exception as e:
-            self.login_logger.warning(f"首页访问异常: {e}")
+                    self.login_logger.info(f"已捕获全局 formhash: {self.post_formhash[:8]}...")
+            except Exception:
+                pass
+        else:
+            self.login_logger.error("验证未通过（可能未点击或仍被拦截）。")
+        return cleared
+
+    # ------------------------------------------------------------------ #
+    #  通过真实 Edge 页面 fetch 的请求封装
+    # ------------------------------------------------------------------ #
+    def _net(self, method, url, data=None, headers=None):
+        body = urlencode(data) if data else None
+        opts = {"method": method, "url": url, "body": body, "headers": headers or {}}
+        return self.page.evaluate(_JS_TEXT, opts)
+
+    def _img_b64(self, url):
+        return self.page.evaluate(_JS_B64, url)
+
+    def ensure_access(self):
+        """用真实 Edge 过 Turnstile，保留可用的 page。"""
         return self.solve_turnstile()
 
     # ------------------------------------------------------------------ #
-    #  原有 Discuz 逻辑（改用 curl_cffi 会话，逻辑不变）
+    #  Discuz 逻辑（全部经真实 Edge fetch）
     # ------------------------------------------------------------------ #
     def get_login_formhash(self):
         url = f"{self.base_url}/member.php?mod=logging&action=login"
-        text = self.session.get(url).text
+        text = self._net("GET", url)
         loginhash_match = re.search(r'<div id="main_messaqge_(.+?)">', text)
         formhash_match = re.search(r'<input type="hidden" name="formhash" value="([0-9a-f]+)"', text)
         if not loginhash_match or not formhash_match:
@@ -247,20 +234,19 @@ class Gamemale:
         self.login_logger.info(f"正在识别验证码 [最大重试次数: {max_retries}]")
         for attempt in range(1, max_retries + 1):
             update_url = f"{self.base_url}/misc.php?mod=seccode&action=update&idhash=cSA&0.1234567&modid=member::logging"
-            update_text = self.session.get(update_url).text
+            update_text = self._net("GET", update_url)
             update_match = re.search(r"update=(.+?)&idhash=", update_text)
             if not update_match:
                 continue
             code_url = f"{self.base_url}/misc.php?mod=seccode&update={update_match.group(1)}&idhash=cSA"
-            headers = {'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                       'Referer': f"{self.base_url}/member.php?mod=logging&action=login"}
-            code_resp = self.session.get(code_url, headers=headers)
-            if not code_resp.content:
+            b64 = self._img_b64(code_url)
+            raw = base64.b64decode(b64)
+            if not raw:
                 continue
-            code = self.ocr.classification(code_resp.content)
+            code = self.ocr.classification(raw)
             verify_url = (f"{self.base_url}/misc.php?mod=seccode&action=check&inajax=1"
                           f"&modid=member::logging&idhash=cSA&secverify={code}")
-            if "succeed" in self.session.get(verify_url).text:
+            if "succeed" in self._net("GET", verify_url):
                 self.login_logger.info(f"验证码识别成功: {code} (尝试第 {attempt} 次)")
                 return code
         return ""
@@ -284,11 +270,12 @@ class Gamemale:
             'cookietime': 2592000, 'seccodehash': 'cSA',
             'seccodemodid': 'member::logging', 'seccodeverify': code,
         }
-        resp_text = self.session.post(login_url, data=form_data).text
+        resp_text = self._net("POST", login_url, data=form_data,
+                              headers={"x-requested-with": "XMLHttpRequest"})
         if "succeed" in resp_text:
             self.login_logger.info("登录成功")
             try:
-                text = self.session.get(f"{self.base_url}/forum.php").text
+                text = self._net("GET", f"{self.base_url}/forum.php")
                 fm = re.search(r'<input type="hidden" name="formhash" value="([0-9a-f]+)"', text)
                 if fm:
                     self.post_formhash = fm.group(1)
@@ -306,7 +293,7 @@ class Gamemale:
             return
         url = f"{self.base_url}/k_misign-sign.html?operation=qiandao&format=button&formhash={self.post_formhash}"
         try:
-            res = self.session.get(url).text
+            res = self._net("GET", url)
             if "签到成功" in res:
                 self.sign_result = "签到成功"
             elif "已签" in res:
@@ -327,7 +314,8 @@ class Gamemale:
                    'referer': f"{self.base_url}/it618_award-award.html",
                    'x-requested-with': 'XMLHttpRequest'}
         try:
-            res_json = self.session.get(url, headers=headers).json()
+            res = self._net("GET", url, headers=headers)
+            res_json = json.loads(res)
             if res_json.get("tipname") == "":
                 self.exchange_result = "无奖励（今日或已抽奖）"
             elif res_json.get("tipname") == "ok":
@@ -343,7 +331,7 @@ class Gamemale:
         count = 0
         for uid in uids:
             try:
-                self.session.get(f"{self.base_url}/space-uid-{uid}.html")
+                self._net("GET", f"{self.base_url}/space-uid-{uid}.html")
                 count += 1
                 time.sleep(1)
             except Exception:
@@ -357,7 +345,7 @@ class Gamemale:
             url = f"{self.base_url}/home.php?mod=spacecp&ac=poke&op=send&uid={uid}&inajax=1"
             data = {'formhash': self.post_formhash, 'poke': '1', 'iconid': '3', 'pokesubmit': 'true'}
             try:
-                if "succeed" in self.session.post(url, data=data).text:
+                if "succeed" in self._net("POST", url, data=data, headers={"x-requested-with": "XMLHttpRequest"}):
                     count += 1
                 time.sleep(1)
             except Exception:
@@ -369,16 +357,16 @@ class Gamemale:
         while count < 10 and page <= 3:
             list_url = f"{self.base_url}/home.php?mod=space&do=blog&view=all&catid=14&page={page}"
             try:
-                res = self.session.get(list_url).text
+                res = self._net("GET", list_url)
                 blog_urls = set(re.findall(r'home\.php\?mod=space(?:&amp;|&)uid=\d+(?:&amp;|&)do=blog(?:&amp;|&)id=\d+', res))
                 for uri in blog_urls:
                     if count >= 10:
                         break
-                    blog_res = self.session.get(f"{self.base_url}/{uri.replace('&amp;', '&')}").text
+                    blog_res = self._net("GET", f"{self.base_url}/{uri.replace('&amp;', '&')}")
                     m = re.search(r'(home\.php\?mod=spacecp(?:&amp;|&)ac=click(?:&amp;|&)op=add[^"\']+)', blog_res)
                     if m:
                         click_url = f"{self.base_url}/{m.group(1).replace('&amp;', '&')}"
-                        if "成功" in self.session.get(click_url, headers={'x-requested-with': 'XMLHttpRequest'}).text:
+                        if "成功" in self._net("GET", click_url, headers={"x-requested-with": "XMLHttpRequest"}):
                             count += 1
                     time.sleep(1)
             except Exception:
@@ -393,12 +381,12 @@ class Gamemale:
         headers = {'x-requested-with': 'XMLHttpRequest', 'origin': f"https://{self.hostname}",
                    'referer': f"{self.base_url}/plugin.php?id=viewui_draw"}
         try:
-            response = self.session.post(url, data=data, headers=headers)
+            resp = self._net("POST", url, data=data, headers=headers)
             try:
-                res_json = response.json()
-                msg = res_json.get("message", response.text[:20])
+                res_json = json.loads(resp)
+                msg = res_json.get("message", resp[:20])
             except Exception:
-                msg = response.text[:20]
+                msg = resp[:20]
             self.task_logger.info(f"[Debug] 你画我猜真实返回: {msg}")
             if "成功" in msg or "succeed" in msg:
                 return "出题成功"
@@ -413,7 +401,7 @@ class Gamemale:
         self.task_logger.info("正在获取实时个人资产数据 (极简稳定版)...")
         url = f"{self.base_url}/home.php?mod=spacecp&ac=credit&op=base"
         try:
-            res = self.session.get(url).text
+            res = self._net("GET", url)
             clean_text = re.sub(r'<[^>]+>', '', res)
             assets_dict = {}
             for item in ['金币', '血液', '旅程', '追随', '知识', '咒术', '堕落', '灵魂']:
@@ -483,7 +471,7 @@ class Gamemale:
             self.notice_logger.error(f"推送邮件发送失败: {e}")
 
     def run(self):
-        self.main_logger.info("=== GM-All-In-One v2 任务引擎启动（真实 Edge + curl_cffi）===")
+        self.main_logger.info("=== GM-All-In-One v2 任务引擎启动（真实 Edge 方案）===")
         if not self.ensure_access():
             self.main_logger.error("无法通过 Cloudflare 验证，任务中止。请确认能看到真实 Edge 窗口并手动点一下验证。")
             return
@@ -495,6 +483,11 @@ class Gamemale:
         self.fetch_assets()
         self.send_notification()
         self.main_logger.info("=== 所有作业同步执行完毕 ===")
+        try:
+            if getattr(self, "_pw", None):
+                self._pw.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
