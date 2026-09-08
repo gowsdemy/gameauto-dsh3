@@ -34,6 +34,23 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 
+
+def load_env_file(path="config.env"):
+    """若存在配置文件，则按 KEY=VALUE 逐行读取（# 开头为注释），已存在的环境变量不覆盖。"""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k:
+                os.environ.setdefault(k, v)
+
+
 # ---------------------------------------------------------------------------
 # 代理配置（可选）
 # ---------------------------------------------------------------------------
@@ -548,6 +565,7 @@ class Gamemale:
 
 
 if __name__ == "__main__":
+    load_env_file("config.env")
     username = os.getenv("USERNAME")
     password = os.getenv("PASSWORD")
     if not username or not password:
