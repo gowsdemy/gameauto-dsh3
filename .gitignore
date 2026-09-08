@@ -2,3 +2,5 @@
 *.pyc
 .venv/
 config.env
+cookies.json
+_edge_profile/
