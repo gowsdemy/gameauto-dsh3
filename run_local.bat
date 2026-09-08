@@ -1,34 +1,37 @@
 @echo off
+chcp 65001 >nul
 REM ============================================================
-REM  GameMale 自动签到 —— 本地运行（方案 B）
-REM  使用你自己的家庭 IP，可自动通过 Cloudflare 人机验证。
+REM  GameMale Auto Sign-in - LOCAL RUN (real Edge + Cloudflare)
+REM  Uses your own home IP and real Edge browser to pass the
+REM  Cloudflare Turnstile verification. Requires Python 3.10+.
 REM ============================================================
 setlocal
 cd /d "%~dp0"
 
-REM ---- 1) 配置 -------------
+REM ---- 1) config check ----
 if not exist config.env (
-    echo [提示] 未找到 config.env，请先复制 config.env.example 为 config.env 并填写账号密码。
+    echo [ERROR] config.env not found. Copy config.env.example to config.env and fill it with your account info.
+    echo Example:  copy config.env.example config.env
     pause
     exit /b 1
 )
 
-REM ---- 2) 创建虚拟环境并安装依赖（首次运行较慢）----
+REM ---- 2) create venv + install deps (first run is slow) ----
 if not exist .venv (
-    echo [步骤] 正在创建 Python 虚拟环境...
+    echo [STEP] Creating Python virtual environment...
     py -3 -m venv .venv || python -m venv .venv
 )
 call .venv\Scripts\activate.bat
-echo [步骤] 正在安装/更新依赖...
-pip install --upgrade pip
+echo [STEP] Installing / updating dependencies...
+python -m pip install --upgrade pip
 pip install ddddocr playwright
 python -m playwright install chromium
 
-REM ---- 3) 运行 -------------
-echo [步骤] 开始运行...
+REM ---- 3) run ----
+echo [STEP] Starting...
 python gamemale_v2.py
 
 echo.
-echo [完成] 按任意键关闭窗口。
+echo [DONE] Finished. Press any key to close.
 pause >nul
 endlocal
