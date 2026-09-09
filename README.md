@@ -17,7 +17,8 @@
 
 ## 快速上手（本地运行）
 
-**需要**：Windows 电脑 + 已安装 Microsoft Edge + Python 3.10+（[官网下载](https://www.python.org/downloads/)，安装时勾选 *Add Python to PATH*）。
+**需要**：Windows 电脑 + 已安装 Python 3.10+（[官网下载](https://www.python.org/downloads/)，安装时勾选 *Add Python to PATH*）。
+浏览器方面，脚本会**自动检测 Edge / Chrome**（Chromium 系都行）；只要装了其中任意一个即可，无需手动配置。
 
 1. 下载/解压本仓库到不含中文、空格的路径，如 `C:\gameauto`。
 2. 复制 `config.env.example` 为 `config.env`，用记事本填：

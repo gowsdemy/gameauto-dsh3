@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GM-All-In-One v2 —— 适配 Cloudflare Turnstile 人机验证门（真实 Edge 方案）
+GM-All-In-One v2 —— 适配 Cloudflare Turnstile 人机验证门（真实浏览器 方案）
 ============================================================
 论坛 www.gamemale.com 的 Discuz 插件 dev8133_cloudflare 加了 Cloudflare Turnstile
 "请进行人机验证"门。实测（真实环境）：
   - Playwright 自带的 Chromium 会被识别为自动化，验证报 600010；
-  - 【真实 Edge】能通过验证；
+  - 【真实浏览器】能通过验证；
   - 外部库(requests / curl_cffi) 连 Cloudflare 会被重置连接（TLS 指纹不认）。
 
-因此本脚本采用：【真实 Edge】加载论坛通过 Turnstile，然后【所有请求都通过
-Edge 页面内的 fetch() 发出】——即用 Edge 的真内核 + Cookie + TLS，既能免验证，
+因此本脚本采用：【真实浏览器】加载论坛通过 Turnstile，然后【所有请求都通过
+浏览器页面内的 fetch() 发出】——即用浏览器的真内核 + Cookie + TLS，既能免验证，
 又不会被重置。登录/签到/抽奖/互动/抓资产/邮件全部保留。
 """
 import re
@@ -31,27 +31,47 @@ from urllib.parse import urlencode
 import ddddocr
 
 
-def _find_edge():
-    """自动查找本机 Edge 可执行文件，避免写死路径，方便分发到其它电脑。"""
-    cands = [
-        os.environ.get("EDGE_PATH", ""),
+def _find_browser():
+    """自动查找本机的浏览器可执行文件（Edge / Chrome / 其它 Chromium 系），避免写死路径，方便分发。
+    优先级：环境变量 BROWSER_PATH > Edge(系统) > Chrome(系统) > Chrome(用户) > PATH 里的浏览器名。"""
+    local = os.environ.get("LOCALAPPDATA", "")
+
+    def _ok(p):
+        return p and os.path.exists(p)
+
+    cands = [os.environ.get("BROWSER_PATH") or os.environ.get("EDGE_PATH") or ""]
+    cands += [
+        # Microsoft Edge
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        # Google Chrome（系统级）
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        # Google Chrome（用户级）
+        os.path.join(local, "Google", "Chrome", "Application", "chrome.exe") if local else "",
     ]
     for c in cands:
-        if c and os.path.exists(c):
+        if _ok(c):
             return c
+    # 其它平台：查 PATH
     try:
         import shutil as _sh
-        p = _sh.which("msedge")
-        if p:
-            return p
+        for name in ("google-chrome", "chromium", "chromium-browser", "chrome",
+                     "microsoft-edge", "msedge"):
+            p = _sh.which(name)
+            if p:
+                return p
     except Exception:
         pass
-    return cands[1] if cands else "msedge"
+    # 兜底：返回第一个候选（通常是 Edge 路径）
+    for c in cands:
+        if c:
+            return c
+    return "msedge"
 
 
-EDGE_EXE = _find_edge()
+# 自动检测到的浏览器可执行文件路径（Edge 或 Chrome 等）
+BROWSER_EXE = _find_browser()
 
 
 def load_env_file(path="config.env"):
@@ -87,7 +107,7 @@ def setup_logger(name, verbose=False):
     return logger
 
 
-# 在 Edge 页面里执行的 fetch 辅助脚本
+# 在浏览器页面里执行的 fetch 辅助脚本
 _JS_TEXT = """async (opts) => {
   const init = {method: (opts.method||'GET'), credentials:'include'};
   init.headers = Object.assign({}, opts.headers||{});
@@ -134,10 +154,10 @@ class Gamemale:
         self.answer = str(answer) if answer else ""
         self.hostname = "www.gamemale.com"
         self.base_url = f"https://{self.hostname}"
-        self.page = None   # 真实 Edge 页面，用于全部请求
+        self.page = None   # 真实浏览器 页面，用于全部请求
 
     # ------------------------------------------------------------------ #
-    #  真实 Edge 启动 + Turnstile 通过
+    #  真实浏览器 启动 + Turnstile 通过
     # ------------------------------------------------------------------ #
     def _wait_debug_port(self, port, timeout=40):
         url = f"http://127.0.0.1:{port}/json/version"
@@ -149,16 +169,17 @@ class Gamemale:
                 time.sleep(1)
         return None
 
-    def _kill_my_edge(self, profile):
-        """结束本脚本上一次启动、占用该 profile 的 Edge 进程，避免 profile 锁定导致启动失败。"""
+    def _kill_my_browser(self, profile):
+        """结束本脚本上一次启动、占用该 profile 的浏览器进程（Edge/Chrome），避免 profile 锁定。"""
+        marker = os.path.basename(profile)  # 如 _browser_profile
         try:
             out = subprocess.run(
-                "wmic process where \"name='msedge.exe'\" get ProcessId,CommandLine /format:csv",
+                "wmic process where \"name='msedge.exe' or name='chrome.exe'\" get ProcessId,CommandLine /format:csv",
                 capture_output=True, text=True, timeout=20).stdout or ""
         except Exception:
             return
         for line in out.splitlines():
-            if "_edge_profile" not in line:
+            if marker not in line:
                 continue
             parts = [p.strip().strip('"') for p in line.split(",")]
             if len(parts) < 2:
@@ -167,13 +188,13 @@ class Gamemale:
             if pid.isdigit() and pid != "ProcessId":
                 subprocess.run(f"taskkill /f /pid {pid}", shell=True, capture_output=True)
 
-    def _launch_real_edge(self):
-        profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_edge_profile")
-        self._kill_my_edge(profile)
+    def _launch_real_browser(self):
+        profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_browser_profile")
+        self._kill_my_browser(profile)
         # 每次全新 profile，避免上次登录会话残留导致“已登录”而看不到登录表单
         shutil.rmtree(profile, ignore_errors=True)
         os.makedirs(profile, exist_ok=True)
-        # 预置 Preferences，关闭 Edge 首次运行/引导/购物助手，避免弹出“插件安装成功”等标签页
+        # 预置 Preferences，关闭浏览器首次运行/引导等，避免弹出“插件安装成功/同步”等标签页
         try:
             prefs_path = os.path.join(profile, "Default", "Preferences")
             os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
@@ -191,7 +212,7 @@ class Gamemale:
         except Exception as e:
             self.main_logger.debug(f"写 Preferences 失败: {e}")
         port = 9335
-        argv = [EDGE_EXE, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+        argv = [BROWSER_EXE, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
                 "--no-first-run", "--no-default-browser-check",
                 "--disable-features=msEdgeFirstRunExperience,msEdgeAutomaticSignin,"
                 "msEdgeSyncConfirmationDialog,msEdgeShoppingAssistantEnabled,"
@@ -216,13 +237,13 @@ class Gamemale:
         return ("discuz" in low) or ("member.php" in low) or ("gamemale" in low and "登录" in content)
 
     def solve_turnstile(self):
-        """用真实 Edge 打开论坛，让 Turnstile 通过，并保留页面对象供后续 fetch。"""
-        self.login_logger.info("正在用真实 Edge 打开论坛以通过 Cloudflare 验证 ...")
-        v, port = self._launch_real_edge()
+        """用真实浏览器 打开论坛，让 Turnstile 通过，并保留页面对象供后续 fetch。"""
+        self.login_logger.info("正在用真实浏览器 打开论坛以通过 Cloudflare 验证 ...")
+        v, port = self._launch_real_browser()
         if not v:
-            self.login_logger.error("无法启动/连接真实 Edge。")
+            self.login_logger.error("无法启动/连接真实浏览器。")
             return False
-        self.login_logger.info(f"真实 Edge 已就绪: {v.get('Browser', '?')}")
+        self.login_logger.info(f"真实浏览器 已就绪: {v.get('Browser', '?')}")
 
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
@@ -238,7 +259,7 @@ class Gamemale:
             page.goto(self.base_url + "/", wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
             self.login_logger.warning(f"加载论坛异常: {e}")
-        self.login_logger.info("真实 Edge 窗口已打开。若验证未自动通过，请手动点击验证框（最多等 180 秒）")
+        self.login_logger.info("真实浏览器 窗口已打开。若验证未自动通过，请手动点击验证框（最多等 180 秒）")
         cleared = False
         for i in range(36):
             time.sleep(5)
@@ -269,7 +290,7 @@ class Gamemale:
         return cleared
 
     # ------------------------------------------------------------------ #
-    #  通过真实 Edge 页面 fetch 的请求封装
+    #  通过真实浏览器 页面 fetch 的请求封装
     # ------------------------------------------------------------------ #
     def _net(self, method, url, data=None, headers=None):
         body = urlencode(data) if data else None
@@ -280,11 +301,11 @@ class Gamemale:
         return self.page.evaluate(_JS_B64, url)
 
     def ensure_access(self):
-        """用真实 Edge 过 Turnstile，保留可用的 page。"""
+        """用真实浏览器 过 Turnstile，保留可用的 page。"""
         return self.solve_turnstile()
 
     # ------------------------------------------------------------------ #
-    #  Discuz 逻辑（全部经真实 Edge fetch）
+    #  Discuz 逻辑（全部经真实浏览器 fetch）
     # ------------------------------------------------------------------ #
     def get_login_formhash(self):
         url = f"{self.base_url}/member.php?mod=logging&action=login"
@@ -548,9 +569,9 @@ class Gamemale:
         self.notice_logger.error(f"推送邮件发送失败（所有端口均失败）: {last_err}")
 
     def run(self):
-        self.main_logger.info("=== GM-All-In-One v2 任务引擎启动（真实 Edge 方案）===")
+        self.main_logger.info("=== GM-All-In-One v2 任务引擎启动（真实浏览器 方案）===")
         if not self.ensure_access():
-            self.main_logger.error("无法通过 Cloudflare 验证，任务中止。请确认能看到真实 Edge 窗口并手动点一下验证。")
+            self.main_logger.error("无法通过 Cloudflare 验证，任务中止。请确认能看到真实浏览器 窗口并手动点一下验证。")
             return
         if not self.login():
             return
