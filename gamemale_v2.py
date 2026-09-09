@@ -255,7 +255,7 @@ class Gamemale:
                 page.goto(self.base_url + "/", wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 self.login_logger.warning(f"加载论坛异常: {e}")
-            step = 3 if visible else 3
+            step = 2
             cleared = False
             for i in range(int(max_wait_seconds / step)):
                 time.sleep(step)
@@ -297,18 +297,18 @@ class Gamemale:
         self.login_logger.info("正在尝试静默(无头)打开论坛 ...")
         v, port = self._launch_real_browser(headless=True)
         if v:
-            page = self._open_page_and_wait(port, max_wait_seconds=15, visible=False)
+            page = self._open_page_and_wait(port, max_wait_seconds=12, visible=False)
             if page is not None:
                 self.login_logger.info("检测到有效验证 cookie，静默通过。")
                 return True
-            # 静默失败（首次/过期）：关掉无头浏览器，回退到可见窗口
+            # 静默失败（首次/过期，或需要验证）：关掉无头浏览器，回退到可见窗口
             try:
                 self._pw.stop()
             except Exception:
                 pass
             self._kill_my_browser(self._profile_path())
-        # 2) 首次/过期：可见窗口，请你点一次人机验证（仅这一次）
-        self.login_logger.info("需要一次性验证：将打开浏览器窗口，请在窗口里点一下人机验证框。")
+        # 2) 需要验证（首次/过期）：才弹出可见窗口，让你点一次人机验证
+        self.login_logger.info("【需要验证】将弹出浏览器窗口，请在窗口里点一下人机验证框。")
         v, port = self._launch_real_browser(headless=False)
         if not v:
             self.login_logger.error("无法启动/连接浏览器。")
