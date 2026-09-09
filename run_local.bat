@@ -44,6 +44,6 @@ echo [INFO] A real Edge window will open. If it shows a verification box, click 
 python gamemale_v2.py
 
 echo.
-echo [DONE] Finished. Press any key to close.
-pause >nul
+echo [DONE] Task finished. Press any key to close now, or it will auto-close in 10 seconds.
+timeout /t 10
 endlocal
