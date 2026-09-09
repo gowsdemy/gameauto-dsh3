@@ -155,6 +155,8 @@ class Gamemale:
         self.hostname = "www.gamemale.com"
         self.base_url = f"https://{self.hostname}"
         self.page = None   # 真实浏览器 页面，用于全部请求
+        self._browser = None
+        self._pw = None
 
     # ------------------------------------------------------------------ #
     #  真实浏览器 启动 + Turnstile 通过
@@ -191,7 +193,8 @@ class Gamemale:
     def _launch_real_browser(self, headless=True):
         profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_browser_profile")
         self._kill_my_browser(profile)
-        # 持久化：不每次删除配置目录，这样验证/登录 cookie 能留存，之后可静默免验证+免登录。
+        # 每次用全新配置目录（避免残留会话冲突），改由“cookie 文件 + 注入”实现免验证/免登录。
+        shutil.rmtree(profile, ignore_errors=True)
         os.makedirs(profile, exist_ok=True)
         # 仅首次写入 Preferences（关闭首次运行/引导等弹窗）；之后保留用户会话，不再覆盖。
         prefs_path = os.path.join(profile, "Default", "Preferences")
@@ -249,6 +252,14 @@ class Gamemale:
             return None
         try:
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            # 注入上次保存的会话 cookie（验证 + 登录），若有效可直接免验证/免登录
+            saved = self._load_saved_cookies()
+            if saved:
+                try:
+                    ctx.add_cookies(saved)
+                    self.login_logger.info("已注入持久化的会话 cookie。")
+                except Exception as e:
+                    self.login_logger.warning(f"注入 cookie 失败: {e}")
             page = ctx.new_page()
             page.set_default_timeout(60000)
             try:
@@ -271,6 +282,7 @@ class Gamemale:
                     self.login_logger.warning(f"  检测异常: {e}")
             if cleared:
                 self.page = page
+                self._browser = browser
                 self.login_logger.info("Cloudflare 验证通过。")
                 try:
                     text = page.content()
@@ -318,6 +330,46 @@ class Gamemale:
 
     def _profile_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_browser_profile")
+
+    def _cookies_file(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_session_cookies.json")
+
+    def _load_saved_cookies(self):
+        try:
+            with open(self._cookies_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else None
+        except Exception:
+            return None
+
+    def _save_cookies(self):
+        """把当前浏览器会话的 cookie 存到本地文件，供下次启动注入（实现免验证/免登录）。"""
+        try:
+            if not self.page:
+                return
+            cookies = self.page.context.cookies()
+            with open(self._cookies_file(), "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            self.login_logger.info(f"已保存 {len(cookies)} 个会话 cookie。")
+        except Exception as e:
+            self.main_logger.debug(f"保存 cookie 失败: {e}")
+
+    def _close_browser(self):
+        """关闭浏览器；先保存 cookie，再清理可能残留的浏览器进程。"""
+        self._save_cookies()
+        try:
+            if getattr(self, "_browser", None):
+                self._browser.close()   # 通过 CDP 正常关闭
+        except Exception as e:
+            self.main_logger.debug(f"优雅关闭浏览器 EXC: {e}")
+        try:
+            if getattr(self, "_pw", None):
+                self._pw.stop()
+        except Exception:
+            pass
+        time.sleep(1)
+        # 清理残留进程（cookie 已存文件，强制清理不影响持久化）
+        self._kill_my_browser(self._profile_path())
 
     # ------------------------------------------------------------------ #
     #  通过真实浏览器 页面 fetch 的请求封装
@@ -648,11 +700,7 @@ class Gamemale:
         self.send_notification()
         self.main_logger.info("=== 所有作业同步执行完毕 ===")
         self._notify_done()
-        try:
-            if getattr(self, "_pw", None):
-                self._pw.stop()
-        except Exception:
-            pass
+        self._close_browser()
 
 
 if __name__ == "__main__":
