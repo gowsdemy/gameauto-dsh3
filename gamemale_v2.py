@@ -30,7 +30,28 @@ from urllib.parse import urlencode
 
 import ddddocr
 
-EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+def _find_edge():
+    """自动查找本机 Edge 可执行文件，避免写死路径，方便分发到其它电脑。"""
+    cands = [
+        os.environ.get("EDGE_PATH", ""),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    try:
+        import shutil as _sh
+        p = _sh.which("msedge")
+        if p:
+            return p
+    except Exception:
+        pass
+    return cands[1] if cands else "msedge"
+
+
+EDGE_EXE = _find_edge()
 
 
 def load_env_file(path="config.env"):
@@ -489,7 +510,8 @@ class Gamemale:
         if not mail_to or not mail_to.strip():
             mail_to = mail_user
         if not all([smtp_host, mail_user, mail_pass]):
-            self.notice_logger.warning("未配置完整 SMTP，跳过邮件")
+            self.notice_logger.info("未配置邮箱（SMTP_HOST / MAIL_USER / MAIL_PASS 为空），已跳过邮件通知。"
+                                    "本地仍会打印任务与资产结果。若需邮件，请在 config.env 填写邮箱相关项。")
             return
         mail_content = (
             f"<h3>GameMale 每日自动化任务报告</h3>"

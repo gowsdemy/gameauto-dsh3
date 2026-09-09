@@ -25,7 +25,6 @@ call .venv\Scripts\activate.bat
 echo [STEP] Installing / updating dependencies...
 python -m pip install --upgrade pip
 pip install ddddocr playwright
-python -m playwright install chromium
 
 REM ---- 3) run ----
 echo [STEP] Starting...
