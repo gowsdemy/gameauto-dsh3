@@ -305,21 +305,25 @@ class Gamemale:
             return None
 
     def solve_turnstile(self):
-        # 1) 先试静默(无头)：若已有持久化的 cloudflare cookie，可直接放行（免验证、免登录）
-        self.login_logger.info("正在尝试静默(无头)打开论坛 ...")
-        v, port = self._launch_real_browser(headless=True)
-        if v:
+        # 1) 先静默(无头)尝试，最多 3 次：网络偶发重置时靠重试自救，避免无谓弹窗
+        for attempt in range(1, 4):
+            self.login_logger.info(f"正在尝试静默(无头)打开论坛 ...（第 {attempt}/3 次）")
+            v, port = self._launch_real_browser(headless=True)
+            if not v:
+                self.login_logger.warning("无头浏览器启动/连接失败，稍后重试。")
+                continue
             page = self._open_page_and_wait(port, max_wait_seconds=12, visible=False)
             if page is not None:
                 self.login_logger.info("检测到有效验证 cookie，静默通过。")
                 return True
-            # 静默失败（首次/过期，或需要验证）：关掉无头浏览器，回退到可见窗口
+            # 本次静默失败：清理浏览器，准备重试
             try:
                 self._pw.stop()
             except Exception:
                 pass
             self._kill_my_browser(self._profile_path())
-        # 2) 需要验证（首次/过期）：才弹出可见窗口，让你点一次人机验证
+            time.sleep(2)
+        # 2) 三次都失败，才弹出可见窗口，让你点一次人机验证
         self.login_logger.info("【需要验证】将弹出浏览器窗口，请在窗口里点一下人机验证框。")
         v, port = self._launch_real_browser(headless=False)
         if not v:
